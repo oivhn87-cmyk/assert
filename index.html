@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>8番出口 - オンラインマルチ修正版</title>
+    <!-- PeerJS (リアルタイム通信ライブラリ) -->
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <style>
+        * {
+            box-sizing: border-box;
+            user-select: none;
+            -webkit-user-select: none;
+            touch-action: manipulation;
+        }
+        body {
+            background-color: #111;
+            color: #fff;
+            font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+            text-align: center;
+            margin: 0;
+            padding: 10px;
+        }
+        #game-container {
+            max-width: 500px;
+            margin: 0 auto;
+        }
+        h1 { font-size: 20px; margin: 5px 0; }
+        #status { font-size: 18px; margin: 5px 0 10px 0; color: #f39c12; }
+        
+        /* オンライン設定パネル */
+        #online-box {
+            background: #222;
+            border: 1px solid #444;
+            padding: 10px;
+            border-radius: 8px;
+            margin-bottom: 10px;
+            font-size: 13px;
+        }
+        .url-container {
+            display: flex;
+            gap: 5px;
+            margin-top: 5px;
+        }
+        #share-url {
+            flex: 1;
+            padding: 8px;
+            background: #000;
+            color: #0f0;
+            border: 1px solid #555;
+            border-radius: 4px;
+            font-size: 11px;
+        }
+        .copy-btn {
+            padding: 8px 12px;
+            font-size: 12px;
+            font-weight: bold;
+            background: #f39c12;
+            color: #000;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+
+        canvas {
+            border: 2px solid #555;
+            background-color: #000;
+            width: 100%;
+            max-width: 500px;
+            height: auto;
+            aspect-ratio: 5 / 3;
+            border-radius: 8px;
+        }
+        
+        .controls {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+            margin-top: 10px;
+        }
+        .btn-row {
+            display: flex;
+            gap: 8px;
+            width: 100%;
+        }
+        button.ctrl-btn {
+            flex: 1;
+            padding: 14px 0;
+            font-size: 15px;
+            font-weight: bold;
+            background-color: #333;
+            color: white;
+            border: 2px solid #666;
+            border-radius: 8px;
+            cursor: pointer;
+            -webkit-tap-highlight-color: transparent;
+        }
+        button.ctrl-btn.active {
+            background-color: #f39c12;
+            color: #000;
+            border-color: #fff;
+        }
+        button.ctrl-btn:active { transform: scale(0.96); }
+    </style>
+</head>
+<body>
+
+<div id="game-container">
+    <h1>8番出口 - Online Fixed</h1>
+    
+    <!-- 招待リンク・接続情報 -->
+    <div id="online-box">
+        <span id="network-status">🌐 サーバー接続中...</span>
+        <div class="url-container">
+            <input type="text" id="share-url" readonly value="準備中...">
+            <button class="copy-btn" onclick="copyLink()">リンクをコピー</button>
+        </div>
+        <div id="player-count" style="margin-top:5px; color:#aaa;">オンライン人数: 1人</div>
+    </div>
+
+    <div id="status">現在の地下通路: 0番出口</div>
+    
+    <canvas id="gameCanvas" width="500" height="300"></canvas>
+
+    <div class="controls">
+        <div class="btn-row">
+            <button class="ctrl-btn" id="btn-look-left">◀ 左を見る</button>
+            <button class="ctrl-btn active" id="btn-look-center">正面</button>
+            <button class="ctrl-btn" id="btn-look-right">右を見る ▶</button>
+        </div>
+        <div class="btn-row">
+            <button class="ctrl-btn" id="btn-forward">▲ 前に進む</button>
+            <button class="ctrl-btn" id="btn-back">▼ 引き返す</button>
+        </div>
+    </div>
+</div>
+
+<script>
+    const canvas = document.getElementById("gameCanvas");
+    const ctx = canvas.getContext("2d");
+    const statusText = document.getElementById("status");
+
+    let exitNumber = 0;
+    let hasAnomaly = false;
+    let anomalyType = 0;
+
+    // プレイヤーの位置 (0:手前スタート ~ 1:奥ゴール)
+    let myZ = 0.1;
+    let viewAngle = "center";
+    let isMovingForward = false;
+    let isMovingBack = false;
+
+    // おじさん（歩行者）の位置
+    let manZ = 0.8;
+
+    // オンライン接続用
+    const otherPlayers = {};
+    let peer = null;
+    let connections = [];
+    let myId = "";
+    let myColor = `hsl(${Math.floor(Math.random() * 360)}, 80%, 60%)`;
+
+    // 1. クリップボードへの確実なコピー機能
+    async function copyLink() {
+        const urlInput = document.getElementById("share-url");
+        try {
+            await navigator.clipboard.writeText(urlInput.value);
+            alert("招待リンクをコピーしました！\n友達に送信して一緒に遊べます。");
+        } catch (err) {
+            // フォールバック（標準コピー）
+            urlInput.select();
+            document.execCommand("copy");
+            alert("招待リンクをコピーしました！");
+        }
+    }
+
+    // 2. ネットワーク通信の初期化
+    function initNetwork() {
+        const urlParams = new URLSearchParams(window.location.search);
+        const hostId = urlParams.get('room');
+
+        peer = new Peer();
+
+        peer.on('open', (id) => {
+            myId = id;
+            document.getElementById('network-status').textContent = "🌐 オンライン接続完了！";
+
+            const shareUrl = window.location.origin + window.location.pathname + '?room=' + (hostId || id);
+            document.getElementById('share-url').value = shareUrl;
+
+            if (hostId && hostId !== id) {
+                connectToPeer(hostId);
+            }
+        });
+
+        peer.on('connection', (conn) => {
+            setupConnection(conn);
+        });
+    }
+
+    function connectToPeer(targetId) {
+        const conn = peer.connect(targetId);
+        setupConnection(conn);
+    }
+
+    function setupConnection(conn) {
+        conn.on('open', () => {
+            connections.push(conn);
+            updatePlayerCount();
+
+            // 位置情報の送信
+            setInterval(() => {
+                conn.send({
+                    type: 'position',
+                    id: myId,
+                    z: myZ,
+                    angle: viewAngle,
+                    color: myColor
+                });
+            }, 50);
+        });
+
+        conn.on('data', (data) => {
+            if (data.type === 'position') {
+                otherPlayers[data.id] = { z: data.z, angle: data.angle, color: data.color };
+            }
+        });
+
+        conn.on('close', () => {
+            delete otherPlayers[conn.peer];
+            connections = connections.filter(c => c !== conn);
+            updatePlayerCount();
+        });
+    }
+
+    function updatePlayerCount() {
+        const count = Object.keys(otherPlayers).length + 1;
+        document.getElementById('player-count').textContent = `オンライン人数: ${count}人`;
+    }
+
+    // 3. ゲーム基本処理
+    function init() {
+        document.getElementById("btn-look-left").onclick = () => setView("left");
+        document.getElementById("btn-look-center").onclick = () => setView("center");
+        document.getElementById("btn-look-right").onclick = () => setView("right");
+
+        bindHoldButton("btn-forward", (v) => isMovingForward = v);
+        bindHoldButton("btn-back", (v) => isMovingBack = v);
+
+        // キーボード操作（方向キーの修正：Upで前進、Downで後退）
+        window.addEventListener("keydown", (e) => {
+            if (e.key === "ArrowUp" || e.key === "w") isMovingForward = true;
+            if (e.key === "ArrowDown" || e.key === "s") isMovingBack = true;
+            if (e.key === "ArrowLeft" || e.key === "a") setView("left");
+            if (e.key === "ArrowRight" || e.key === "d") setView("right");
+        });
+        window.addEventListener("keyup", (e) => {
+            if (e.key === "ArrowUp" || e.key === "w") isMovingForward = false;
+            if (e.key === "ArrowDown" || e.key === "s") isMovingBack = false;
+        });
+
+        initNetwork();
+        nextCorridor();
+        requestAnimationFrame(gameLoop);
+    }
+
+    function setView(angle) {
+        viewAngle = angle;
+        document.getElementById("btn-look-left").classList.toggle("active", angle === "left");
+        document.getElementById("btn-look-center").classList.toggle("active", angle === "center");
+        document.getElementById("btn-look-right").classList.toggle("active", angle === "right");
+    }
+
+    function bindHoldButton(id, callback) {
+        const btn = document.getElementById(id);
+        btn.addEventListener("pointerdown", (e) => { e.preventDefault(); callback(true); });
+        btn.addEventListener("pointerup", (e) => { e.preventDefault(); callback(false); });
+        btn.addEventListener("pointerleave", (e) => { e.preventDefault(); callback(false); });
+    }
+
+    function nextCorridor() {
+        myZ = 0.1; // スタート位置（手前）
+        manZ = 0.8; // おじさん初期位置（奥）
+        setView("center");
+
+        if (exitNumber === 0) {
+            hasAnomaly = false;
+        } else {
+            hasAnomaly = Math.random() < 0.5;
+            anomalyType = Math.floor(Math.random() * 3);
+        }
+
+        updateStatus();
+    }
+
+    function gameLoop() {
+        // 【修正】前進＝z増加（奥に向かう）、後退＝z減少（手前に戻る）
+        if (isMovingForward) myZ += 0.007;
+        if (isMovingBack) myZ -= 0.007;
+
+        // おじさんの移動（奥から手前へ歩いてくる）
+        manZ -= 0.0015;
+        if (manZ < 0) manZ = 0.9;
+
+        // 通路の端に到達した際の判定
+        if (myZ >= 0.95) {
+            checkChoice('forward'); // 奥に進みきった
+        } else if (myZ <= -0.05) {
+            checkChoice('back'); // 手前に戻りきった
+        }
+
+        drawScene();
+        requestAnimationFrame(gameLoop);
+    }
+
+    function checkChoice(action) {
+        let isCorrect = (action === 'forward' && !hasAnomaly) || (action === 'back' && hasAnomaly);
+
+        if (isCorrect) {
+            exitNumber++;
+            if (exitNumber === 8) {
+                alert("🎉 脱出成功！\n8番出口から無事に外へ出られました！");
+                exitNumber = 0;
+            }
+        } else {
+            alert("❌ 異変を見落としました...\n0番出口に戻されてしまった。");
+            exitNumber = 0;
+        }
+        nextCorridor();
+    }
+
+    function updateStatus() {
+        statusText.textContent = `現在の地下通路: ${exitNumber}番出口`;
+    }
+
+    // 描画処理
+    function drawScene() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = "#1b1b1b";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        if (viewAngle === "center") {
+            drawCenterView();
+        } else if (viewAngle === "left") {
+            drawLeftWallView();
+        } else if (viewAngle === "right") {
+            drawRightWallView();
+        }
+    }
+
+    // 正面画面の描画
+    function drawCenterView() {
+        const zoom = 1 + myZ * 1.5;
+        const cx = 250, cy = 150;
+        const nw = 200 / zoom, nh = 140 / zoom;
+
+        // 天井・床
+        ctx.fillStyle = "#2a2a2a";
+        ctx.beginPath();
+        ctx.moveTo(0, 0); ctx.lineTo(cx - nw, cy - nh); ctx.lineTo(cx + nw, cy - nh); ctx.lineTo(500, 0); ctx.fill();
+
+        ctx.fillStyle = "#121212";
+        ctx.beginPath();
+        ctx.moveTo(0, 300); ctx.lineTo(cx - nw, cy + nh); ctx.lineTo(cx + nw, cy + nh); ctx.lineTo(500, 300); ctx.fill();
+
+        // 奥の壁
+        ctx.fillStyle = "#0a0a0a";
+        ctx.fillRect(cx - nw, cy - nh, nw * 2, nh * 2);
+
+        // 黄色い出口標識
+        ctx.fillStyle = "#e6c200";
+        ctx.fillRect(cx - 50 / zoom, cy - nh + 10 / zoom, 100 / zoom, 25 / zoom);
+        ctx.fillStyle = "#000";
+        ctx.font = `bold ${Math.max(10, 14 / zoom)}px sans-serif`;
+        ctx.textAlign = "center";
+        ctx.fillText(`地下通路 8`, cx, cy - nh + 27 / zoom);
+
+        // 【復活】歩くおじさんを描画
+        drawMan();
+
+        // オンラインの他プレイヤーを描画
+        drawOtherPlayers();
+    }
+
+    // 【復活】歩くおじさんを描く関数
+    function drawMan() {
+        const relZ = manZ - myZ;
+        if (relZ <= 0.05 || relZ > 1.2) return; // プレイヤーの背後にいる場合は描画しない
+
+        ctx.save();
+        const scale = (1 / relZ) * 0.25;
+        const y = 150 + (60 / relZ);
+
+        // 異変0：巨大化
+        let finalScale = scale;
+        if (hasAnomaly && anomalyType === 0) finalScale *= 2.0;
+
+        ctx.translate(250, y);
+        ctx.scale(finalScale, finalScale);
+
+        const walkCycle = Math.sin(manZ * 60);
+
+        // 胴体・足
+        ctx.fillStyle = "#445566";
+        ctx.fillRect(-12, -45, 24, 30);
+        ctx.fillStyle = "#222";
+        ctx.fillRect(-10, -15, 8, 25 + walkCycle * 3);
+        ctx.fillRect(2, -15, 8, 25 - walkCycle * 3);
+
+        // 頭・髪
+        ctx.fillStyle = "#ffcc99";
+        ctx.beginPath(); ctx.arc(0, -55, 10, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = "#333";
+        ctx.beginPath(); ctx.arc(0, -58, 10, Math.PI, Math.PI * 2); ctx.fill();
+
+        // 腕
+        ctx.strokeStyle = "#445566"; ctx.lineWidth = 4;
+        ctx.beginPath(); ctx.moveTo(-12, -40); ctx.lineTo(-18, -25); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(12, -40); ctx.lineTo(18, -25); ctx.stroke();
+
+        ctx.restore();
+    }
+
+    // 他プレイヤー描画
+    function drawOtherPlayers() {
+        for (const id in otherPlayers) {
+            const player = otherPlayers[id];
+            if (player.angle !== "center") continue;
+
+            const relZ = player.z - myZ;
+            if (relZ <= 0.05 || relZ > 1.2) continue;
+
+            ctx.save();
+            const scale = (1 / relZ) * 0.25;
+            const y = 150 + (60 / relZ);
+
+            ctx.translate(250, y);
+            ctx.scale(scale, scale);
+
+            ctx.fillStyle = player.color || "#3498db";
+            ctx.fillRect(-12, -45, 24, 30);
+            ctx.fillStyle = "#222";
+            ctx.fillRect(-10, -15, 8, 25);
+            ctx.fillRect(2, -15, 8, 25);
+
+            ctx.fillStyle = "#ffcc99";
+            ctx.beginPath(); ctx.arc(0, -55, 10, 0, Math.PI * 2); ctx.fill();
+
+            ctx.fillStyle = "#fff";
+            ctx.font = "bold 12px sans-serif";
+            ctx.textAlign = "center";
+            ctx.fillText("P2", 0, -70);
+
+            ctx.restore();
+        }
+    }
+
+    // 左右の壁（ポスター・看板）
+    function drawLeftWallView() {
+        ctx.fillStyle = "#222"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+        const posterX = 180 + (myZ - 0.5) * 200;
+
+        ctx.fillStyle = "#fff"; ctx.fillRect(posterX - 65, 65, 130, 170);
+
+        if (hasAnomaly && anomalyType === 1) {
+            ctx.fillStyle = "#800000"; ctx.fillRect(posterX - 60, 70, 120, 160);
+            ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(posterX, 130, 30, 0, Math.PI * 2); ctx.fill();
+        } else {
+            ctx.fillStyle = "#3498db"; ctx.fillRect(posterX - 60, 70, 120, 160);
+        }
+    }
+
+    function drawRightWallView() {
+        ctx.fillStyle = "#222"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+        const signX = 250 - (myZ - 0.5) * 200;
+
+        ctx.fillStyle = "#00a854"; ctx.fillRect(signX - 70, 80, 140, 90);
+    }
+
+    init();
+</script>
+
+</body>
+</html>
